@@ -1,1 +1,15 @@
-
+{
+  "name": "wolf-bot",
+  "version": "1.0.0",
+  "description": "Wolf.js AI Bot for language learning, translation and word games",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.1",
+    "wolf.js": "2.7.10"
+  }
+}
