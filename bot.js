@@ -17,7 +17,7 @@ const ai = new GoogleGenAI({
   apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY || 'dummy',
   httpOptions: { apiVersion: '', baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL || undefined },
 });
-const MODEL = 'gemini-3-flash-preview'; // أسرع نموذج
+const MODEL = 'gemini-3-flash-preview';
 
 /** استدعاء Gemini بأقل عدد توكينز */
 async function ask(prompt, maxTokens = 512) {
@@ -29,10 +29,16 @@ async function ask(prompt, maxTokens = 512) {
   return (r.text || '').trim();
 }
 
-/** استخراج JSON من الرد */
+/** استخراج JSON من الرد — يتعامل مع markdown code blocks */
 function parseJSON(text) {
-  const m = text.match(/\{[\s\S]*\}/);
-  return m ? JSON.parse(m[0]) : null;
+  const clean = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+  const m = clean.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  let s = m[0];
+  const opens  = (s.match(/\{/g) || []).length;
+  const closes = (s.match(/\}/g) || []).length;
+  if (opens > closes) s += '}'.repeat(opens - closes);
+  try { return JSON.parse(s); } catch { return null; }
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -46,7 +52,6 @@ try { players = JSON.parse(readFileSync(DATA_FILE, 'utf8')); } catch {}
 
 let saveTimer = null;
 function scheduleSave() {
-  // حفظ غير متزامن مع تجميع (debounce) لتقليل عمليات القرص
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => writeFileSync(DATA_FILE, JSON.stringify(players), 'utf8'), 2000);
 }
@@ -70,32 +75,14 @@ function addPoints(id, nick, chId, pts) {
 // ───────────────────────────────────────────────────────────────
 //  حالة الألعاب
 // ───────────────────────────────────────────────────────────────
-const games = {};           // games[channelId] = state
-const AUTO_DELAY = 30000;   // 30 ثانية للوضع التلقائي
+const games = {};
+const AUTO_DELAY = 30000;
 
 // ───────────────────────────────────────────────────────────────
 //  كشف الأوامر  — REGEX محلي فوري (بدون AI)
-//  يدعم العربية + الإنجليزية + أي بادئة مشتركة
 // ───────────────────────────────────────────────────────────────
-
-/*
-  بنية الرسالة:
-    !<keyword> [args...]   ← أوامر عامة
-    &<text>                ← إجابة على لعبة
-
-  المفاتيح المعرّفة (أي ترجمة/هجاء مقبول):
-    معنى / meaning / définition / 意思 / значение / bedeutung / significado / …
-    ترجمه / translate / traduire / 翻译 / перевод / übersetzen / traducir / …
-    بدء / start / démarrer / 开始 / начать / starten / iniciar / …
-    تالي / next / suivant / 下一个 / следующий / nächste / siguiente / …
-    مجموع / score / points / …
-    مساعده / help / aide / 帮助 / …
-    تلقائي / auto / automatique / 自动 / авто / …
-*/
-
-// مفاتيح regex لكل معنى
 const RX = {
-  meaning   : /^!(معنى|meaning|significa(?:do|t)|d[eé]finition|意思|значение|bedeutung|ma'na|anlamı|معني|māne|अर्थ|अर्थ|معنا)\s+(.+)/iu,
+  meaning   : /^!(معنى|meaning|significa(?:do|t)|d[eé]finition|意思|значение|bedeutung|ma'na|anlamı|معني|māne|अर्थ|معنا)\s+(.+)/iu,
   translate : /^!(ترجم[هة]?|translate|translat|traduire|traducir|traduzir|перевод|übersetz|翻译|çeviri|ترجمه|翻訳)\s+(.+)/iu,
   help      : /^!(لغه?\s*مساعد[هة]?|help|aide|hilfe|ayuda|помощь|帮助|yardım|yardim|语言帮助|lang\s*help)/iu,
   score     : /^!(لغه?\s*مجموع?|my\s*score|score|نقاط|points|punkty|puan|分数|очки|язык\s*счёт)/iu,
@@ -103,36 +90,24 @@ const RX = {
   gl_rank   : /^!(لغه?\s*ترتيب\s*ولف|global\s*rank(?:ing)?|wolf\s*rank(?:ing)?|全球排名|глобальный\s*рейтинг)/iu,
   auto      : /^!(لغه?\s*تلقائي|auto\s*mode?|mode\s*auto|автоматически|自动模式|otomatik)/iu,
   next      : /^!(لغه?\s*[تt]الي|next|suivant|nächste|siguiente|下一个|следующий|sonraki)/iu,
-
-  // ألعاب
   game_guess: /^!(كلمات\s*المعاني|guess\s*word|deviner\s*mot|猜词|угадать\s*слово|wort\s*erraten|adivinar\s*palabra)\s*(بدء|start|démarrer|开始|начать|starten|iniciar)?$/iu,
   game_word : /^!(معاني\s*الكلمات?|word\s*meaning|词义|смысл\s*слова|bedeutung\s*wort|significado\s*palabra)\s*(بدء|start|démarrer|开始|начать|starten|iniciar)?$/iu,
   game_parse: /^!(اعرب?|إعراب|parse|parsing|syntaxe|语法分析|синтаксис|grammatik|análisis)\s*(الجمل[هة]?)?\s*(بدء|start|démarrer|开始|начать|starten|iniciar)?$/iu,
-
-  // ألعاب الترجمة  →  !ترجمه كلمات/جمله/نص {من} {الى} بدء
   game_tr_w : /^!(ترجم[هة]?\s*كلمات?|translate\s*words?|traduire\s*mots?|翻译词语)\s+(\S+)\s+(\S+)(?:\s+(?:بدء|start|开始|начать))?$/iu,
-  game_tr_s : /^!(ترجم[هة]?\s*جمل[هة]?|translate\s*sentence|traduire\s*phrase|翻译句子)\s+(\S+)\s+(\S+)(?:\s+(?:بدء|start|开始|начать))?$/iu,
+  game_tr_s : /^!(ترجم[هة]?\s*جمل[هة]?|translate\s*sentence|traduire\s*phrase|翻译句子)\s+(\S+)\s+(\S+)(?:\s+(?:بدء|start|开始|начات))?$/iu,
   game_tr_t : /^!(ترجم[هة]?\s*نص?|translate\s*text|traduire\s*texte|翻译文本)\s+(\S+)\s+(\S+)(?:\s+(?:بدء|start|开始|начать))?$/iu,
 };
 
-/**
- * تحليل الرسالة محلياً بدون AI.
- * إذا لم يتطابق أي نمط، ترجع null ← يُحوَّل للـ AI.
- */
 function localDetect(body) {
   let m;
-
   if ((m = body.match(RX.meaning)))
     return { cmd: 'MEANING', param: m[2].trim(), langFrom: '', langTo: '', lang: 'ar' };
-
   if ((m = body.match(RX.translate))) {
-    // !ترجمه {اللغة} {النص...}
     const rest = m[2].trim();
     const sp = rest.indexOf(' ');
     if (sp === -1) return null;
     return { cmd: 'TRANSLATE', langTo: rest.slice(0, sp), param: rest.slice(sp + 1).trim(), lang: 'ar' };
   }
-
   if (RX.help.test(body))     return { cmd: 'HELP' };
   if (RX.score.test(body))    return { cmd: 'SHOW_SCORE' };
   if (RX.ch_rank.test(body))  return { cmd: 'CHANNEL_RANK' };
@@ -142,18 +117,15 @@ function localDetect(body) {
   if (RX.game_guess.test(body)) return { cmd: 'GAME_GUESS_WORD', lang: 'ar' };
   if (RX.game_word.test(body))  return { cmd: 'GAME_WORD_MEANING', lang: 'ar' };
   if (RX.game_parse.test(body)) return { cmd: 'GAME_PARSE', lang: 'ar' };
-
   if ((m = body.match(RX.game_tr_w)))
     return { cmd: 'GAME_TRANSLATE_WORDS', langFrom: m[2], langTo: m[3], lang: 'ar' };
   if ((m = body.match(RX.game_tr_s)))
     return { cmd: 'GAME_TRANSLATE_SENTENCE', langFrom: m[2], langTo: m[3], lang: 'ar' };
   if ((m = body.match(RX.game_tr_t)))
     return { cmd: 'GAME_TRANSLATE_TEXT', langFrom: m[2], langTo: m[3], lang: 'ar' };
-
-  return null; // لا يتطابق محلياً → يُرسل للـ AI
+  return null;
 }
 
-/** كشف AI فقط للأوامر غير العربية أو غير المعروفة */
 async function aiDetect(body) {
   const r = await ask(
     `Bot command detector. Message: "${body.slice(0, 200)}"
@@ -165,35 +137,57 @@ Respond JSON only:
 }
 
 // ───────────────────────────────────────────────────────────────
-//  فحص المحتوى المحظور (سريع)
+//  فحص المحتوى المحظور
 // ───────────────────────────────────────────────────────────────
-// قائمة محلية سريعة للكلمات الحساسة الواضحة
 const BLOCKED_WORDS = /\b(sex|porn|nude|naked|politics|religion|allah|god|jesus|christ|prophet|quran|bible|isis|terror|bomb|kill|رقبة|قتل|إرهاب|داعش|سياسة|حكومة|ديانة|إباحي|جنسي)\b/i;
 
 async function isForbidden(text) {
-  if (BLOCKED_WORDS.test(text)) return true; // فلتر محلي فوري
+  if (BLOCKED_WORDS.test(text)) return true;
   const r = await ask(`Is this text politically, religiously, or sexually offensive? "${text.slice(0, 200)}" Reply YES or NO only.`, 5);
   return r.toUpperCase().startsWith('Y');
+}
+
+// ───────────────────────────────────────────────────────────────
+//  تحويل كود اللغة إلى اسمها الكامل
+// ───────────────────────────────────────────────────────────────
+const LANG_NAMES = {
+  ar: 'Arabic', en: 'English', fr: 'French', de: 'German',
+  es: 'Spanish', it: 'Italian', pt: 'Portuguese', ru: 'Russian',
+  zh: 'Chinese', ja: 'Japanese', ko: 'Korean', tr: 'Turkish',
+  fa: 'Persian', ur: 'Urdu', hi: 'Hindi', nl: 'Dutch',
+  pl: 'Polish', sv: 'Swedish', da: 'Danish', fi: 'Finnish',
+};
+function langName(code) {
+  return LANG_NAMES[String(code).toLowerCase()] || String(code);
 }
 
 // ───────────────────────────────────────────────────────────────
 //  توليد أسئلة الألعاب
 // ───────────────────────────────────────────────────────────────
 async function genGuessWord(lang) {
-  const r = await ask(`Random useful ${lang} word + definition. No politics/religion/adult. JSON:{"word":"","definition":"","difficulty":2}`, 120);
+  const ln = langName(lang);
+  const r = await ask(`Give one random useful ${ln} word and its definition. No politics/religion/adult content. Reply with ONLY this JSON, no markdown:\n{"word":"","definition":"","difficulty":2}`, 200);
   return parseJSON(r);
 }
 async function genWordMeaning(lang) {
-  const r = await ask(`Random useful ${lang} word + meaning. No politics/religion/adult. JSON:{"word":"","meaning":"","difficulty":2}`, 120);
+  const ln = langName(lang);
+  const r = await ask(`Give one random useful ${ln} word and its meaning. No politics/religion/adult content. Reply with ONLY this JSON, no markdown:\n{"word":"","meaning":"","difficulty":2}`, 200);
   return parseJSON(r);
 }
 async function genTranslation(from, to, type) {
-  const ct = type === 'GAME_TRANSLATE_WORDS' ? 'one word' : type === 'GAME_TRANSLATE_SENTENCE' ? 'one useful sentence/proverb' : '2-3 sentence paragraph';
-  const r = await ask(`Pick ${ct} in ${from} for translation to ${to}. Cultural, no politics/religion/adult. JSON:{"content":"","translation":"","difficulty":2,"wordCount":1}`, 200);
+  const fromName = langName(from);
+  const toName   = langName(to);
+  const ct = type === 'GAME_TRANSLATE_WORDS' ? 'one common word' : type === 'GAME_TRANSLATE_SENTENCE' ? 'one useful sentence or proverb' : 'a 2-3 sentence paragraph';
+  const r = await ask(`Pick ${ct} in ${fromName} to translate into ${toName}. Cultural/educational, no politics/religion/adult content. Reply with ONLY this JSON, no markdown:\n{"content":"","translation":"","difficulty":2,"wordCount":1}`, 300);
   return parseJSON(r);
 }
 async function genParse(lang) {
-  const r = await ask(`Pick a ${lang} grammatically rich sentence for parsing exercise. No politics/religion/adult. JSON:{"sentence":"","parsing":"","difficulty":3}`, 250);
+  const ln = langName(lang);
+  const isAr = ln === 'Arabic';
+  const r = await ask(
+    `${ln} grammar exercise. Write ONE short sentence (no diacritics/tashkeel) then brief grammatical parsing (subject/verb/object). No politics/religion/adult. JSON only, no markdown:\n{"sentence":"","parsing":"","difficulty":3}`,
+    isAr ? 1500 : 600
+  );
   return parseJSON(r);
 }
 
@@ -226,15 +220,33 @@ async function buildQuestion(type, langFrom, langTo, lang) {
 // ───────────────────────────────────────────────────────────────
 //  التحقق من الإجابة
 // ───────────────────────────────────────────────────────────────
-async function checkAnswer(question, correctAnswer, playerAnswer) {
-  const r = await ask(
-    `Lenient answer checker for language learning game.
-Q: "${question.slice(0, 150)}"
-Correct: "${correctAnswer.slice(0, 200)}"
-Player: "${playerAnswer.slice(0, 200)}"
-Accept near-correct answers. JSON:{"correct":true,"percentage":85}`,
-    60,
-  );
+async function checkAnswer(question, correctAnswer, playerAnswer, gameType) {
+  const isParseGame = gameType === 'GAME_PARSE' || question.includes('أعرب');
+
+  const prompt = isParseGame
+    ? `You are a smart and lenient Arabic grammar teacher checking a student's إعراب (grammatical parsing) answer.
+
+Question: "${question.slice(0, 200)}"
+Model answer: "${correctAnswer.slice(0, 400)}"
+Student answer: "${playerAnswer.slice(0, 400)}"
+
+Rules:
+- Accept ANY answer that correctly identifies the grammatical roles (فاعل، مفعول به، فعل، مبتدأ، خبر، etc.) even if phrased differently.
+- Accept partial answers if student got most roles right.
+- Ignore spelling variations, tashkeel differences, or word order.
+- Accept Arabic OR English grammar terms (subject=فاعل, verb=فعل, object=مفعول به).
+- Be VERY lenient — reward understanding over exact wording.
+- percentage: 100 if fully correct, 70-99 if mostly correct, 40-69 if partially correct, 0-39 if mostly wrong.
+Reply with ONLY this JSON, no markdown: {"correct":true,"percentage":85}`
+    : `Lenient language learning answer checker.
+Question: "${question.slice(0, 150)}"
+Correct answer: "${correctAnswer.slice(0, 300)}"
+Player answer: "${playerAnswer.slice(0, 300)}"
+Be flexible: accept near-correct, synonyms, partial matches, different word order.
+percentage 0-100 reflecting how correct the answer is.
+Reply with ONLY this JSON, no markdown: {"correct":true,"percentage":85}`;
+
+  const r = await ask(prompt, isParseGame ? 120 : 80);
   try { return parseJSON(r) || { correct: false, percentage: 0 }; } catch { return { correct: false, percentage: 0 }; }
 }
 
@@ -308,24 +320,19 @@ function m(key, lang, vars = {}) {
 async function startGame(chId, type, langFrom, langTo, lang, reply) {
   const ck = String(chId);
   if (games[ck]?.autoTimer) clearTimeout(games[ck].autoTimer);
-
   games[ck] = {
     type, langFrom, langTo, lang: lang || 'ar',
     question: null, answer: null,
     difficulty: 2, wordCount: 1, nextQ: null,
     autoMode: games[ck]?.autoMode || false, autoTimer: null,
   };
-
-  // إرسال رسالة التحضير + توليد السؤال الحالي والتالي بشكل متوازٍ
   const [,, q, nextQ] = await Promise.all([
     reply(`/me ${m('loading_game', lang)}`),
-    Promise.resolve(), // placeholder
+    Promise.resolve(),
     buildQuestion(type, langFrom, langTo, lang),
     buildQuestion(type, langFrom, langTo, lang),
   ]);
-
   if (!q) { await reply(`/me ${m('game_err', lang)}`); delete games[ck]; return; }
-
   Object.assign(games[ck], { question: q.question, answer: q.answer, difficulty: q.difficulty, wordCount: q.wordCount, nextQ });
   await reply(`/me ${q.question}`);
 }
@@ -334,15 +341,11 @@ async function nextQuestion(chId, reply) {
   const ck = String(chId);
   const st = games[ck];
   if (!st) return;
-
   if (st.autoTimer) { clearTimeout(st.autoTimer); st.autoTimer = null; }
-
-  // إذا كان السؤال التالي جاهزاً → أرسله فوراً ثم حضّر الذي بعده في الخلفية
   const q = st.nextQ;
   if (q) {
     Object.assign(st, { question: q.question, answer: q.answer, difficulty: q.difficulty, wordCount: q.wordCount, nextQ: null });
     await reply(`/me ${q.question}`);
-    // حضّر السؤال الذي بعده في الخلفية
     buildQuestion(st.type, st.langFrom, st.langTo, st.lang).then((nq) => { if (games[ck]) games[ck].nextQ = nq; });
   } else {
     await reply(`/me ${m('loading_game', st.lang)}`);
@@ -354,7 +357,6 @@ async function nextQuestion(chId, reply) {
     Object.assign(st, { question: nq.question, answer: nq.answer, difficulty: nq.difficulty, wordCount: nq.wordCount, nextQ: nnq });
     await reply(`/me ${nq.question}`);
   }
-
   if (st.autoMode) {
     st.autoTimer = setTimeout(() => nextQuestion(chId, reply), AUTO_DELAY);
   }
@@ -371,15 +373,11 @@ client.on('channelMessage', async (message) => {
   try {
     const body = (message.body || '').trim();
     if (!body) return;
-
     const chId = message.isGroup ? message.targetGroupId : null;
-    if (!chId) return; // القنوات فقط
-
+    if (!chId) return;
     const uid  = message.sourceSubscriberId;
     const ck   = String(chId);
     const lang = games[ck]?.lang || 'ar';
-
-    // ─── دالة الرد المختصرة ───
     const reply = (txt) => message.reply(txt).catch((e) => console.error('reply err:', e.message));
 
     // ═══════════════════════════════
@@ -388,152 +386,13 @@ client.on('channelMessage', async (message) => {
     if (body.startsWith('&')) {
       const ans = body.slice(1).trim();
       if (!ans) return;
-
       const st = games[ck];
       if (!st?.question) { reply(`/me ${m('no_game', lang)}`); return; }
-
-      // الحصول على الاسم + فحص الإجابة بالتوازي
       const [sub, check] = await Promise.all([
         client.subscriber.getById(uid).catch(() => null),
-        (reply(`/me ${m('loading_check', st.lang)}`), checkAnswer(st.question, st.answer, ans)),
+        (reply(`/me ${m('loading_check', st.lang)}`), checkAnswer(st.question, st.answer, ans, st.type)),
       ]);
       const nick = sub?.nickname || '';
       const pts  = calcPoints(check.percentage, st.difficulty, st.wordCount);
-
       if (check.correct || check.percentage >= 75) {
-        addPoints(uid, nick, chId, pts);
-        await reply(`/me ${m('correct', st.lang, { p: check.percentage, pts })}`);
-        await nextQuestion(chId, reply);
-      } else if (check.percentage >= 30) {
-        addPoints(uid, nick, chId, pts);
-        await reply(`/me ${m('partial', st.lang, { p: check.percentage, pts })}`);
-      } else {
-        reply(`/alert ${m('wrong', st.lang)}`);
-      }
-      return;
-    }
-
-    // ═══════════════════════════════
-    //  أوامر (تبدأ بـ !)
-    // ═══════════════════════════════
-    if (!body.startsWith('!')) return;
-
-    // كشف سريع محلي أولاً
-    let det = localDetect(body);
-
-    // fallback للـ AI فقط عند الضرورة
-    if (!det) {
-      det = await aiDetect(body);
-    }
-
-    const { cmd, param, langFrom, langTo } = det || {};
-    if (!cmd || cmd === 'NONE') return;
-
-    // ─── الاسم (نحضّره فقط عند الحاجة لأوامر النقاط) ───
-    const getNick = () => client.subscriber.getById(uid).then((s) => s?.nickname || '').catch(() => '');
-
-    switch (cmd) {
-
-      case 'MEANING': {
-        if (!param) return;
-        // فحص المحتوى + إرسال رسالة التحميل بشكل متوازٍ
-        const [forbidden] = await Promise.all([
-          isForbidden(param),
-          reply(`/me ${m('loading_meaning', lang)}`),
-        ]);
-        if (forbidden) { reply(`/alert ${m('violation', lang)}`); return; }
-        const meaning = await ask(`Meaning of "${param}" in the same language. No politics/religion/adult. Direct answer only.`, 400);
-        reply(`/me ${meaning}`);
-        break;
-      }
-
-      case 'TRANSLATE': {
-        if (!param || !langTo) return;
-        const [forbidden] = await Promise.all([
-          isForbidden(param),
-          reply(`/me ${m('loading_trans', lang)}`),
-        ]);
-        if (forbidden) { reply(`/alert ${m('violation', lang)}`); return; }
-        const t = await ask(`Translate to ${langTo}: "${param}". If offensive write FORBIDDEN. Translation only, no explanation.`, 400);
-        if (t.includes('FORBIDDEN')) { reply(`/alert ${m('violation', lang)}`); return; }
-        reply(`/me ${t}`);
-        break;
-      }
-
-      case 'GAME_GUESS_WORD':
-        await startGame(chId, 'GAME_GUESS_WORD', lang, lang, lang, reply); break;
-
-      case 'GAME_WORD_MEANING':
-        await startGame(chId, 'GAME_WORD_MEANING', lang, lang, lang, reply); break;
-
-      case 'GAME_TRANSLATE_WORDS':
-        await startGame(chId, 'GAME_TRANSLATE_WORDS', langFrom || 'ar', langTo || 'en', lang, reply); break;
-
-      case 'GAME_TRANSLATE_SENTENCE':
-        await startGame(chId, 'GAME_TRANSLATE_SENTENCE', langFrom || 'ar', langTo || 'en', lang, reply); break;
-
-      case 'GAME_TRANSLATE_TEXT':
-        await startGame(chId, 'GAME_TRANSLATE_TEXT', langFrom || 'ar', langTo || 'en', lang, reply); break;
-
-      case 'GAME_PARSE':
-        await startGame(chId, 'GAME_PARSE', lang, lang, lang, reply); break;
-
-      case 'TOGGLE_AUTO': {
-        if (!games[ck]) games[ck] = { autoMode: false, autoTimer: null, lang };
-        games[ck].autoMode = !games[ck].autoMode;
-        if (games[ck].autoMode) {
-          reply(`/me ${m('auto_on', lang)}`);
-          if (games[ck].question)
-            games[ck].autoTimer = setTimeout(() => nextQuestion(chId, reply), AUTO_DELAY);
-        } else {
-          if (games[ck].autoTimer) { clearTimeout(games[ck].autoTimer); games[ck].autoTimer = null; }
-          reply(`/me ${m('auto_off', lang)}`);
-        }
-        break;
-      }
-
-      case 'NEXT': {
-        if (!games[ck]?.question) { reply(`/me ${m('no_game', lang)}`); return; }
-        await nextQuestion(chId, reply);
-        break;
-      }
-
-      case 'SHOW_SCORE': {
-        const nick = await getNick();
-        const p = getPlayer(uid, nick, chId);
-        reply(`/me ${m('my_score', lang, { pts: p.totalPoints })}`);
-        break;
-      }
-
-      case 'CHANNEL_RANK': {
-        const ranked = Object.values(players)
-          .filter((p) => p.channels?.[ck] !== undefined)
-          .sort((a, b) => (b.channels[ck] || 0) - (a.channels[ck] || 0))
-          .slice(0, 10);
-        const lines = ranked.length
-          ? ranked.map((p, i) => `${i + 1}- ${p.nickname} (${p.id}) ${p.channels[ck]} نقطة`).join('\n')
-          : '—';
-        reply(`/me ${m('ch_rank_hdr', lang)}\n${lines}`);
-        break;
-      }
-
-      case 'GLOBAL_RANK': {
-        const nick = await getNick();
-        getPlayer(uid, nick, chId);
-        const sorted = Object.values(players).sort((a, b) => (b.totalPoints || 0) - (a.totalPoints || 0));
-        const rank = sorted.findIndex((p) => p.id === uid) + 1;
-        reply(`/me ${m('gl_rank', lang, { r: rank || '—' })}`);
-        break;
-      }
-
-      case 'HELP':
-        reply(`/me ${m('help', lang)}`);
-        break;
-    }
-
-  } catch (err) {
-    console.error('Handler error:', err.message);
-  }
-});
-
-client.login();
+        addPoints(uid, nick, ch
